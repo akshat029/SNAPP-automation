@@ -1,0 +1,26 @@
+# Secrets — NEVER commit .env (keep .env.example as template)
+.env
+!.env.example
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Runtime outputs
+logs/
+screenshots/
+*.log
+*.html
+*.json
+
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+
+# Test cache
+.pytest_cache/

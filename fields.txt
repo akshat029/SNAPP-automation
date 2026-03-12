@@ -1,0 +1,12 @@
+<input class="u-expander-heading c-autocomplete c-journal-autocomplete" type="text" autocomplete="off" data-component-journal-autocomplete-input="data-component-journal-autocomplete-input" value="Bioelectronic Medicine" placeholder="Search by Journal title">
+---
+<input id="search_name" name="search_type" type="radio" value="name" checked="checked">
+---
+<input id="search_email" name="search_type" type="radio" value="email">
+---
+<input class="form-control search-input" id="search_keyword" name="search_keyword" value="" placeholder="Please enter a search term">
+---
+<select class="form-control" id="collection" name="collection" data-component-facet="data-component-facet" data-component-type="dropdown">
+---
+
+=== LABELS ===
