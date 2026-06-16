@@ -197,6 +197,7 @@ class SmartsheetReader:
             "_qualification":   _v("Salutation"),
             "_country":         _v("Country"),
             "_city":            _v("City"),
+            "_onboarding_date": _v("Date to be on-boarded"),
         }
 
         logger.info("Structured request from row %s: action=%s, editor=%s, journal=%s",
@@ -257,3 +258,4 @@ class SmartsheetReader:
 
         logger.warning("Ticket '%s' not found in Smartsheet.", ticket_id)
         return None
+

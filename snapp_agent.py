@@ -386,21 +386,25 @@ class SnappAgent:
             # Clear existing text
             await self.page.keyboard.press("Control+a")
             await self.page.keyboard.press("Backspace")
+            await human_delay(0.2, 0.3)
 
-            # Type journal name via keyboard (triggers SNAPP autocomplete JS)
+            # Paste journal name via clipboard (fast) to trigger autocomplete
             words = journal_name.split()
             short_name = " ".join(words[:min(4, len(words))])
-            await journal_input.first.press_sequentially(short_name, delay=40)
-            logger.info("Typed journal search: '%s'", short_name)
+            await self.page.evaluate(
+                "text => navigator.clipboard.writeText(text)", short_name
+            )
+            await self.page.keyboard.press("Control+v")
+            logger.info("Pasted journal search: '%s'", short_name)
 
-            # Wait for autocomplete suggestions
+            # Wait for autocomplete suggestions (quick check)
             suggestion = (
                 self.page.get_by_role("option", name=journal_name)
                 .or_(self.page.get_by_role("listitem").filter(has_text=journal_name))
                 .or_(self.page.locator("li, a, [class*='autocomplete-suggestion']").filter(has_text=journal_name))
             )
             try:
-                await suggestion.first.wait_for(state="visible", timeout=8_000)
+                await suggestion.first.wait_for(state="visible", timeout=5_000)
             except Exception:
                 pass
 
@@ -669,10 +673,19 @@ class SnappAgent:
         return False
 
     async def _fill_affiliation_autocomplete(self, value: str) -> bool:
-        """Fill the affiliation field using manual typing to trigger autocomplete suggestions."""
+        """Fill the affiliation field using manual typing to trigger autocomplete.
+
+        Flow:
+          1. Type affiliation name → autocomplete dropdown appears
+          2. If match found → click it
+          3. If no match → scroll dropdown → click 'Add manually'
+          4. After 'Add manually': select country → click 'Add' button
+        """
         assert self.page is not None
         # Try the known SNAPP ID first, then label-based fallbacks
         loc = self.page.locator("#addEditorAffiliation")
+        if await loc.count() == 0:
+            loc = self.page.locator("#editEditorAffiliation")
         if await loc.count() == 0:
             labels = ["Add an affiliated institution", "Affiliation", "Institution",
                       "affiliated institution"]
@@ -695,23 +708,106 @@ class SnappAgent:
         await human_delay(0.1, 0.2)
 
         # Type character by character to trigger SNAPP autocomplete JS
-        await loc.first.press_sequentially(value, delay=40)
+        await loc.first.press_sequentially(value, delay=30)
         logger.info("Typed affiliation: '%s'", value)
 
         # Wait for suggestions to appear
-        await human_delay(2.0, 3.0)
+        await human_delay(1.5, 2.5)
 
         # Try to click a matching suggestion from the dropdown
         suggestion = (
             self.page.get_by_role("option", name=value)
             .or_(self.page.locator("li, .autocomplete-suggestion, [class*='suggestion']").filter(has_text=value))
-            .or_(self.page.get_by_text(value, exact=False))
         )
         if await suggestion.count() > 0:
-            await suggestion.first.click()
-            logger.info("Selected affiliation from suggestions: '%s'", value)
-        else:
-            logger.info("No autocomplete match for affiliation — typed value stays: '%s'", value)
+            try:
+                await suggestion.first.click()
+                logger.info("Selected affiliation from suggestions: '%s'", value)
+                return True
+            except Exception:
+                logger.warning("Could not click suggestion — will try 'Add manually'")
+
+        # No exact match — scroll dropdown and click "Add manually"
+        logger.info("Affiliation not in suggestions — looking for 'Add manually'")
+
+        # Scroll the dropdown container to reveal "Add manually" at the bottom
+        dropdown = (
+            self.page.locator("[class*='autocomplete'], [class*='dropdown'], [class*='suggestion']")
+            .or_(self.page.locator("[data-component-institution-autocomplete]")
+            .or_(self.page.locator(".c-institution")))
+        )
+        if await dropdown.count() > 0:
+            try:
+                await dropdown.first.evaluate("el => el.scrollTo(0, el.scrollHeight)")
+                await human_delay(0.3, 0.5)
+            except Exception:
+                pass
+
+        # Click "Add manually"
+        add_manually = (
+            self.page.get_by_text("Add manually", exact=False)
+            .or_(self.page.get_by_role("button", name="Add manually"))
+            .or_(self.page.get_by_role("link", name="Add manually"))
+            .or_(self.page.locator("[class*='add-manual'], [data-component*='manual']"))
+        )
+        if await add_manually.count() > 0:
+            try:
+                await add_manually.first.scroll_into_view_if_needed()
+                await human_delay(0.2, 0.3)
+                await human_click(add_manually.first)
+                logger.info("Clicked 'Add manually'")
+                await human_delay(0.5, 1.0)
+
+                # After clicking "Add manually", a form appears:
+                # The affiliation name should already be filled from typing.
+                # We need to: 1) Select country  2) Click "Add" button
+
+                # Select country from the dropdown in the manual-add form
+                country = self.request.get("_country", "").strip()
+                if country:
+                    country_select = (
+                        self.page.locator("#addEditorInstitutionCountry")
+                        .or_(self.page.locator("#editEditorInstitutionCountry"))
+                        .or_(self.page.locator("select[name='institutionCountry']")
+                        .or_(self.page.get_by_label("Country")))
+                    )
+                    if await country_select.count() > 0:
+                        try:
+                            await country_select.first.select_option(label=country)
+                            logger.info("Selected country in manual affiliation: '%s'", country)
+                        except Exception:
+                            # JS fallback for hidden selects
+                            await country_select.first.evaluate(
+                                """(el, label) => {
+                                    for (const opt of el.options) {
+                                        if (opt.textContent.trim().includes(label)) {
+                                            el.value = opt.value;
+                                            el.dispatchEvent(new Event('change', {bubbles: true}));
+                                            break;
+                                        }
+                                    }
+                                }""", country
+                            )
+                            logger.info("Selected country via JS: '%s'", country)
+
+                # Click the "Add" button to confirm the affiliation
+                add_btn = (
+                    self.page.get_by_role("button", name="Add")
+                    .or_(self.page.locator("button[data-component-institution-add]")
+                    .or_(self.page.locator(".c-institution button")))
+                )
+                if await add_btn.count() > 0:
+                    await human_click(add_btn.first)
+                    logger.info("Clicked 'Add' to confirm affiliation: '%s'", value)
+                    await human_delay(0.5, 1.0)
+                else:
+                    logger.warning("'Add' button not found after 'Add manually'")
+
+                return True
+            except Exception as exc:
+                logger.warning("Error in 'Add manually' flow: %s", exc)
+
+        logger.info("No suggestion match and no 'Add manually' — typed value stays: '%s'", value)
         return True
 
     async def _select_role_radio(self, role: str) -> bool:
@@ -888,6 +984,59 @@ class SnappAgent:
             logger.error("Error creating keyword on internal URL: %s", exc, exc_info=True)
             return False
 
+    # ── Future onboarding unavailability (inline, during onboard form) ────
+
+    async def _fill_onboarding_unavailability(self) -> None:
+        """If the onboarding date is in the future, fill unavailability on the current form.
+
+        Called during onboarding (Step 2 of the form) BEFORE clicking Save.
+        Sets temporary unavailability: From = today, To = onboarding_date - 1 day.
+
+        If onboarding date is today, in the past, or missing — this is a no-op.
+        Wrapped in try/except so it never breaks the onboarding.
+        """
+        onboarding_date_str = self.request.get("_onboarding_date", "").strip()
+        if not onboarding_date_str:
+            return
+
+        try:
+            from datetime import date, timedelta
+
+            onboarding_date_normalized = self._normalize_date(onboarding_date_str)
+            onboarding_date = date.fromisoformat(onboarding_date_normalized)
+            today = date.today()
+
+            if onboarding_date <= today:
+                logger.info(
+                    "[ONBOARD-UNAVAIL] Onboarding date %s is today or past — "
+                    "no unavailability needed",
+                    onboarding_date,
+                )
+                return
+
+            unavail_from = today.isoformat()
+            unavail_to = (onboarding_date - timedelta(days=1)).isoformat()
+
+            logger.info(
+                "[ONBOARD-UNAVAIL] Onboarding date is %s (future). "
+                "Setting unavailability on form: %s to %s",
+                onboarding_date, unavail_from, unavail_to,
+            )
+
+            # The unavailability dates are on the NEXT wizard step (Step 3).
+            # Click Next to advance to the step with date fields.
+            logger.info("[ONBOARD-UNAVAIL] Clicking Next to reach unavailability step")
+            if await self._click_next():
+                await self.set_unavailability(unavail_from, unavail_to)
+            else:
+                logger.warning("[ONBOARD-UNAVAIL] No Next button — trying to set dates on current page")
+                await self.set_unavailability(unavail_from, unavail_to)
+
+        except Exception as exc:
+            logger.warning(
+                "[ONBOARD-UNAVAIL] Could not set unavailability: %s", exc,
+            )
+
     # ── Status change (offboard) ──────────────────────────────────────────
 
     async def _select_status_radio(self, status: str) -> bool:
@@ -921,35 +1070,99 @@ class SnappAgent:
     # ── Unavailability dates ──────────────────────────────────────────────
 
     async def set_unavailability(self, from_date: str, to_date: str) -> bool:
-        """Fill the temporary unavailability From/To date pickers."""
+        """Fill the temporary unavailability From/To date pickers.
+
+        Handles BOTH form contexts:
+          - Edit profile: id="editEditorUnavailableFrom" / "editEditorUnavailableTo"
+          - Add (onboard): id="addEditorUnavailableFrom" / "addEditorUnavailableTo"
+
+        For type="date" inputs, .fill() expects YYYY-MM-DD format.
+        Falls back to JavaScript if the element is not visible.
+        """
         assert self.page is not None
         logger.info("Setting unavailability: %s to %s", from_date, to_date)
         try:
+            from_val = self._normalize_date(from_date)
+            to_val = self._normalize_date(to_date)
+
+            # Try all known IDs (edit form + add form) plus name fallback
             from_input = (
-                self.page.get_by_label("From")
-                .or_(self.page.get_by_placeholder("mm/dd/yyyy").first)
+                self.page.locator("#editEditorUnavailableFrom")
+                .or_(self.page.locator("#addEditorUnavailableFrom"))
+                .or_(self.page.locator("input[name='unavailableFrom']"))
             )
             to_input = (
-                self.page.get_by_label("To")
-                .or_(self.page.get_by_placeholder("mm/dd/yyyy").last)
+                self.page.locator("#editEditorUnavailableTo")
+                .or_(self.page.locator("#addEditorUnavailableTo"))
+                .or_(self.page.locator("input[name='unavailableTo']"))
             )
-            if await from_input.count() > 0 and await to_input.count() > 0:
+
+            if await from_input.count() == 0 or await to_input.count() == 0:
+                logger.warning("Date picker fields not found")
+                await self._dump_page("no_date_pickers")
+                return False
+
+            # Check if the element is visible
+            is_visible = await from_input.first.is_visible()
+
+            if is_visible:
+                # Standard approach: click + fill
+                await from_input.first.evaluate("el => el.scrollIntoView({block: 'center'})")
+                await human_delay(0.3, 0.5)
+
                 await from_input.first.click()
                 await human_delay(0.3, 0.5)
-                await from_input.first.fill(from_date)
+                await from_input.first.fill(from_val)
+                logger.info("Filled 'From' date: %s", from_val)
                 await human_delay(0.5, 1.0)
+
                 await to_input.first.click()
                 await human_delay(0.3, 0.5)
-                await to_input.first.fill(to_date)
+                await to_input.first.fill(to_val)
+                logger.info("Filled 'To' date: %s", to_val)
                 await human_delay(0.5, 1.0)
-                logger.info("Unavailability dates filled")
-                return True
-            logger.warning("Date picker fields not found")
-            await self._dump_page("no_date_pickers")
-            return False
+            else:
+                # Element exists but is hidden — use JS directly
+                logger.info("Date fields not visible — setting values via JS")
+
+            # Verify/force values via JS (works for both visible and hidden)
+            actual_from = await from_input.first.evaluate("el => el.value")
+            actual_to = await to_input.first.evaluate("el => el.value")
+            if actual_from != from_val or actual_to != to_val:
+                await from_input.first.evaluate(
+                    f"el => {{ el.value = '{from_val}'; el.dispatchEvent(new Event('change', {{bubbles: true}})); }}"
+                )
+                await to_input.first.evaluate(
+                    f"el => {{ el.value = '{to_val}'; el.dispatchEvent(new Event('change', {{bubbles: true}})); }}"
+                )
+                logger.info("Set dates via JS: %s to %s", from_val, to_val)
+
+            logger.info("Unavailability dates filled successfully")
+            return True
+
         except Exception as exc:
             logger.error("Error setting unavailability: %s", exc, exc_info=True)
+            await self._dump_page("unavailability_error")
             return False
+
+    @staticmethod
+    def _normalize_date(date_str: str) -> str:
+        """Normalize a date string to YYYY-MM-DD format for HTML date inputs."""
+        date_str = date_str.strip()
+        if not date_str:
+            return ""
+        # Already in YYYY-MM-DD format
+        if len(date_str) == 10 and date_str[4] == "-" and date_str[7] == "-":
+            return date_str
+        # Try common formats
+        from datetime import datetime
+        for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y", "%m-%d-%Y", "%d-%m-%Y"):
+            try:
+                return datetime.strptime(date_str, fmt).strftime("%Y-%m-%d")
+            except ValueError:
+                continue
+        logger.warning("Could not parse date '%s' — using as-is", date_str)
+        return date_str
 
     # ── Click Next (for multi-step forms) ─────────────────────────────────
 
@@ -1214,6 +1427,9 @@ class SnappAgent:
             if keywords:
                 await self.add_keywords(keywords)
 
+            # Set unavailability if onboarding date is in the future
+            await self._fill_onboarding_unavailability()
+
             return await self._click_save(["Save and invite editor", "Save", "Submit"])
 
         except Exception as exc:
@@ -1222,11 +1438,14 @@ class SnappAgent:
             return False
 
     async def _onboard_guest_editor(self, collection: str) -> bool:
-        """Onboard a guest editor via 'Add Guest Editor' (single-page form).
+        """Onboard a guest editor via 'Add Guest Editor' (2-step wizard).
 
-        The form is a MODAL with ALL fields on ONE page:
-        Email -> Title -> Given Name -> Family Name -> Affiliation -> Country ->
-        Collection (#addEditorCollection <select>) -> Role (radio) -> Keywords -> Save
+        Step 1 of 2 — Editor personal information:
+        Email -> Title -> Given Name -> Family Name -> Affiliation -> [Next]
+
+        Step 2 of 2 — Journal-specific information:
+        Country -> Collection (#addEditorCollection <select>) -> Role (radio) ->
+        Keywords -> Unavailability (if future onboarding date) -> [Save]
         """
         assert self.page is not None
         req = self.request
@@ -1257,7 +1476,7 @@ class SnappAgent:
 
             await self._dump_page("guest_editor_form")
 
-            # ── Fill all fields in form order ────────────────────────
+            # ── Step 1: Editor personal information ───────────────────
 
             # 1. Email (REQUIRED field on SNAPP form)
             email = req.get("email", "").strip()
@@ -1285,6 +1504,14 @@ class SnappAgent:
             affiliation = req.get("affiliation", "").strip()
             if affiliation:
                 await self._fill_affiliation_autocomplete(affiliation)
+
+            # ── Click Next to advance to Step 2 ──────────────────────
+            logger.info("Clicking 'Next' to advance to Step 2 of 2")
+            if not await self._click_next():
+                logger.warning("'Next' button not found on guest editor form — trying to continue")
+                await self._dump_page("guest_onboard_no_next_btn")
+
+            # ── Step 2: Journal-specific information ──────────────────
 
             # 4. Country (native <select> #addEditorInstitutionCountry)
             country = req.get("_country", "").strip()
@@ -1337,7 +1564,10 @@ class SnappAgent:
             if keywords:
                 await self.add_keywords(keywords)
 
-            # 8. Save
+            # 8. Unavailability (if onboarding date is in the future)
+            await self._fill_onboarding_unavailability()
+
+            # 9. Save
             return await self._click_save(["Save and invite editor", "Save", "Submit"])
 
         except Exception as exc:
