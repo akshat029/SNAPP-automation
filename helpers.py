@@ -23,24 +23,22 @@ T = TypeVar("T")
 # Human-like helpers (stealth)
 # ──────────────────────────────────────────────────────────────────────────────
 
-async def human_delay(low: float = 0.1, high: float = 0.3) -> None:
-    """Sleep for a minimal duration for maximum speed."""
+async def human_delay(low: float = 0.05, high: float = 0.15) -> None:
+    """Sleep a tiny amount — just enough for JS to react."""
     await asyncio.sleep(random.uniform(low, high))
 
 
 async def human_type(page: Page, locator, text: str) -> None:
-    """Instantly paste/fill text into a field for maximum speed."""
+    """Fill text into a field with minimal delay."""
     await locator.click()
-    await human_delay(0.1, 0.2)
     await locator.fill(text)
-    await human_delay(0.1, 0.2)
+    await human_delay(0.05, 0.1)
 
 
 async def human_click(locator) -> None:
-    """Click with a tiny pre-click pause."""
-    await human_delay(0.2, 0.6)
+    """Click with minimal pause."""
     await locator.click()
-    await human_delay(0.5, 1.2)
+    await human_delay(0.1, 0.3)
 
 
 # ──────────────────────────────────────────────────────────────────────────────

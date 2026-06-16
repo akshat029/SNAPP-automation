@@ -16,6 +16,9 @@ screenshots/
 *.html
 *.json
 
+# Ticket store — keep mock fixtures, ignore live data
+!data/mock_tickets.json
+
 # IDE / OS
 .vscode/
 .idea/

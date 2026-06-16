@@ -3,6 +3,8 @@ SNAPP Agent — Smartsheet Integration
 =====================================
 Reads pending editor requests from a Smartsheet and converts them into
 the structured dict format that SnappAgent expects.
+
+Uses actual column names from the Trial Cases sheet.
 """
 
 from __future__ import annotations
@@ -18,42 +20,6 @@ from helpers import parse_editor_name
 
 logger = logging.getLogger("snapp_agent")
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Column mapping — your Smartsheet uses generic names (Column2, Column3, …).
-# This map translates them to meaningful field names based on the actual data.
-# If your Smartsheet columns are renamed later, just update this mapping.
-# ──────────────────────────────────────────────────────────────────────────────
-SMARTSHEET_COLUMN_MAP: dict[str, str] = {
-    "Primary Column": "_timestamp",       # request timestamp
-    "Column2":  "_requester",             # who submitted the request
-    "Column3":  "_ticket_id",             # e.g. EE-2025-07216
-    "Column5":  "_status",               # Received / Done / etc.
-    "Column8":  "_department",            # e.g. 71 - Mathematics
-    "Column9":  "_requester_email",       # requester's email
-    "Column10": "_action_raw",            # raw action: "On-boarding (Only)", etc.
-    "Column11": "_editor_count",          # "One" / "Multiple"
-    "Column12": "_platform",              # "Snapp"
-    "Column15": "journal_id",             # journal numeric ID
-    "Column16": "journal_name",           # journal title
-    "Column19": "editor_name",            # editor full name
-    "Column20": "email",                  # editor email
-    "Column22": "_title",                 # Dr / PhD / Prof etc.
-    "Column23": "affiliation",            # institution
-    "Column24": "_country",              # country
-    "Column26": "_orcid",                # ORCID or similar ID
-    "Column27": "collection_name",        # collection title (Guest Editor)
-    "Column31": "_flag1",
-    "Column32": "_flag2",
-    "Column48": "_editor_type",           # "Guest Editor" / blank
-    "Column52": "role",                   # editorial role
-    "Column62": "_bu",                    # business unit
-    "Column63": "_bu_code",              # BU code
-    "Column64": "_flag3",
-    "Column66": "_period",               # period (e.g. 2026-02)
-    "Column68": "_score1",
-    "Column69": "_score2",
-}
-
 # Action type mapping — translate raw Smartsheet values to agent actions
 ACTION_TYPE_MAP: dict[str, str] = {
     "on-boarding (only)": "onboard",
@@ -61,15 +27,18 @@ ACTION_TYPE_MAP: dict[str, str] = {
     "onboard": "onboard",
     "onboarding": "onboard",
     "off-boarding": "offboard",
+    "off-boarding an editor": "offboard",
     "offboard": "offboard",
     "offboarding": "offboard",
     "deactivate": "offboard",
     "deactivation": "offboard",
     "update": "update",
+    "updating editor information": "update",
     "edit": "update",
     "change": "update",
     "unavailability": "set_unavailability",
     "set unavailability": "set_unavailability",
+    "recording editor unavailability": "set_unavailability",
 }
 
 
@@ -90,120 +59,167 @@ class SmartsheetReader:
         self.client = smartsheet.Smartsheet(self.token)
         self.client.errors_as_exceptions(True)
 
-    def fetch_pending_requests(self) -> list[dict[str, str]]:
+    def fetch_pending_requests(self, max_rows: int = 50) -> list[dict[str, str]]:
         """
-        Fetch all rows whose status is 'Received' (i.e. pending / not yet done).
+        Fetch all rows whose status is 'Received' / blank (i.e. pending).
         Returns a list of structured request dicts ready for SnappAgent.
         """
         sheet = self.client.Sheets.get_sheet(self.sheet_id)
         col_map = {col.id: col.title for col in sheet.columns}
 
         requests: list[dict[str, str]] = []
+        skipped_multi = 0
+        skipped_other = 0
+
         for row in sheet.rows:
-            # Build raw cell dict
+            if len(requests) >= max_rows:
+                logger.info("Reached fetch limit of %d -- stopping", max_rows)
+                break
+
+            # Build raw cell dict using actual column names
             raw: dict[str, Any] = {}
             for cell in row.cells:
                 col_title = col_map.get(cell.column_id, "")
                 raw[col_title] = cell.value
 
-            # Skip empty rows or already-processed rows
-            status = str(raw.get("Column5", "") or "").strip().lower()
-            if status not in ("received", "pending", "new", ""):
-                logger.info("Skipping row %s (status: '%s')", row.id, status)
+            # Skip already-processed rows
+            status = str(raw.get("Status", "") or "").strip().lower()
+            if status not in ("received", "recieved", "pending", "new", ""):
                 continue
 
-            # Skip rows with no editor name and no action
-            if not raw.get("Column19") and not raw.get("Column10"):
+            # Skip rows with no action
+            service = str(raw.get("Service Needed", "") or "").strip()
+            if not service:
+                continue
+
+            # Skip multiple-editor rows
+            count = str(raw.get("SUMMARY: One or Multiple", "") or "").strip().lower()
+            if count == "multiple":
+                skipped_multi += 1
+                continue
+
+            # Check that SNAPP is involved
+            systems = str(raw.get("SUMMARY: System(s)", "") or "").strip().lower()
+            sys_onboard = str(raw.get("System(s) onboarding One", "") or "").strip().lower()
+            if "snapp" not in systems and "snapp" not in sys_onboard:
+                skipped_other += 1
                 continue
 
             request = self._structure_row(raw, row.id)
             if request:
                 requests.append(request)
 
-        logger.info("Fetched %d pending request(s) from Smartsheet", len(requests))
+        logger.info(
+            "Fetched %d pending request(s) from Smartsheet (skipped %d multiple-editor, %d other)",
+            len(requests), skipped_multi, skipped_other,
+        )
         return requests
 
     def _structure_row(self, raw: dict[str, Any], row_id: int) -> dict[str, str]:
         """
-        Convert a raw Smartsheet row into the structured dict
-        that SnappAgent.run() expects.
+        Convert a raw Smartsheet row (using actual column names) into
+        the structured dict that SnappAgent.run() expects.
         """
         def _v(col: str) -> str:
-            """Safely extract a string value from the raw row."""
             val = raw.get(col)
             if val is None:
                 return ""
             return str(val).strip()
 
         # Determine the action type
-        action_raw = _v("Column10").lower()
-        action = ACTION_TYPE_MAP.get(action_raw, "")
+        service = _v("Service Needed").lower()
+        action = ACTION_TYPE_MAP.get(service, "")
         if not action:
-            # Try partial matching
             for key, mapped in ACTION_TYPE_MAP.items():
-                if key in action_raw:
+                if key in service:
                     action = mapped
                     break
         if not action:
-            logger.warning("Row %s: unrecognised action '%s' — defaulting to 'update'",
-                           row_id, _v("Column10"))
-            action = "update"
+            logger.warning("Row %s: unrecognised service '%s' -- skipping", row_id, _v("Service Needed"))
+            return {}
 
-        # Determine if this is a Guest Editor (collection present or type says so)
-        editor_type = _v("Column48").lower()
-        collection_name = _v("Column27")
-        is_guest = bool(collection_name) or "guest" in editor_type
+        # Editor name
+        editor_name = _v("Editor's Full Name")
+        if not editor_name:
+            fn = _v("First Name")
+            ln = _v("Last Name")
+            if fn or ln:
+                editor_name = f"{fn} {ln}".strip()
 
-        # If it's an onboard with a collection name → guest editor onboard
-        if action == "onboard" and is_guest and not collection_name:
-            collection_name = ""  # will still trigger guest flow via editor_type
-
-        # Use shared name-parsing utility
-        editor_name = _v("Column19")
         first_name, last_name = parse_editor_name(editor_name)
+        # Override with explicit columns if present
+        if _v("First Name"):
+            first_name = _v("First Name")
+        if _v("Last Name"):
+            last_name = _v("Last Name")
+
+        # Collection (guest editor)
+        collection_name = _v("Collection Title")
+        collection_id = _v("Collection ID")
+
+        # Role: try multiple columns
+        role = _v("New Snapp Role (onboarding)") or _v("Editor Role") or _v("Updated Snapp Role (if applicable)")
+
+        # Explain Update
+        explain = _v("Explain Update")
+        if explain and action == "update":
+            explain_lower = explain.lower()
+            if any(kw in explain_lower for kw in ["email updated", "change email", "update email", "primary email"]):
+                logger.warning(
+                    "[!] Row %s / %s: 'Explain Update' contains a name or primary email change request. "
+                    "THIS CANNOT BE DONE IN SNAPP. Text: '%s'",
+                    row_id, _v("Ticket Number"), explain
+                )
 
         request = {
             "editor_name":      editor_name,
             "first_name":       first_name,
             "last_name":        last_name,
             "action":           action,
-            "journal_name":     _v("Column16"),
-            "journal_id":       _v("Column15"),
-            "affiliation":      _v("Column23"),
-            "email":            _v("Column20"),
-            "role":             _v("Column52"),
-            "keywords":         "",             # add keyword columns here if available
+            "journal_name":     _v("Journal Title"),
+            "journal_id":       _v("JournalID"),
+            "affiliation":      _v("Institution / Affiliation"),
+            "email":            _v("Editor's Email"),
+            "role":             role,
+            "keywords":         _v("Keywords"),
             "collection_name":  collection_name,
-            "collection_id":    "",
-            "sections":         "",
-            "status":           "",             # for offboard status changes
-            "unavailable_from": "",
-            "unavailable_to":   "",
-            # Metadata (not used by agent, for logging/tracking)
+            "collection_id":    collection_id,
+            "sections":         _v("Section"),
+            "status":           "",
+            "unavailable_from": _v("Unavailable From"),
+            "unavailable_to":   _v("Unavailable To"),
+            # Metadata
             "_row_id":          str(row_id),
-            "_ticket_id":       _v("Column3"),
-            "_requester":       _v("Column2"),
-            "_department":      _v("Column8"),
+            "_ticket_id":       _v("Ticket Number"),
+            "_requester":       _v("Submitter's Name"),
+            "_department":      _v("Publishing Unit Lookup"),
+            "_explain_update":  explain,
+            "_qualification":   _v("Salutation"),
+            "_country":         _v("Country"),
+            "_city":            _v("City"),
         }
 
         logger.info("Structured request from row %s: action=%s, editor=%s, journal=%s",
-                    row_id, action, editor_name, _v("Column16"))
+                     row_id, action, editor_name, _v("Journal Title"))
+        if explain:
+            logger.info("  -> Explain Update: %s", explain)
+
         return request
 
     def mark_row_done(self, row_id: int, result_status: str) -> None:
         """
         Update the row status in Smartsheet to mark it as processed.
-        Writes back to Column5 (status column).
+        Writes back to the 'Status' column.
         """
         try:
             sheet = self.client.Sheets.get_sheet(self.sheet_id)
             status_col_id = None
             for col in sheet.columns:
-                if col.title == "Column5":
+                if col.title == "Status":
                     status_col_id = col.id
                     break
             if not status_col_id:
-                logger.warning("Cannot find Column5 to update status")
+                logger.warning("Cannot find 'Status' column to update")
                 return
 
             new_row = smartsheet.models.Row()
@@ -218,3 +234,26 @@ class SmartsheetReader:
             logger.info("Smartsheet row %s marked as 'Done - %s'", row_id, result_status)
         except Exception as exc:
             logger.error("Failed to update Smartsheet row %s: %s", row_id, exc)
+
+    def fetch_ticket_by_id(self, ticket_id: str) -> dict[str, str] | None:
+        """
+        Fetch a specific ticket by its ticket number/ID from Smartsheet,
+        regardless of its status.
+        """
+        logger.info("Fetching ticket '%s' from Smartsheet...", ticket_id)
+        sheet = self.client.Sheets.get_sheet(self.sheet_id)
+        col_map = {col.id: col.title for col in sheet.columns}
+
+        for row in sheet.rows:
+            raw: dict[str, Any] = {}
+            for cell in row.cells:
+                col_title = col_map.get(cell.column_id, "")
+                raw[col_title] = cell.value
+
+            ticket = str(raw.get("Ticket Number", "") or "").strip()
+            if ticket.lower() == ticket_id.strip().lower():
+                logger.info("Found ticket '%s' in Smartsheet on row %s", ticket, row.id)
+                return self._structure_row(raw, row.id)
+
+        logger.warning("Ticket '%s' not found in Smartsheet.", ticket_id)
+        return None
