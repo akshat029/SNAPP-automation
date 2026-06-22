@@ -474,7 +474,7 @@ class SnappAgent:
             sel = self.page.locator(f"#{sel_id}")
             if await sel.count() > 0:
                 try:
-                    await sel.select_option(label=country)
+                    await sel.select_option(label=country, timeout=5000)
                     logger.info("Selected country: '%s'", country)
                     return True
                 except Exception:
@@ -630,7 +630,11 @@ class SnappAgent:
             if await edit_btn.count() > 0:
                 await human_click(edit_btn.first)
                 await human_delay(2, 4)
-                logger.info("Edit profile form opened")
+                try:
+                    await self.page.wait_for_load_state("domcontentloaded", timeout=15_000)
+                except Exception:
+                    pass
+                logger.info("Edit profile form opened — URL: %s", self.page.url)
                 return True
             logger.error("'Edit profile' button not found")
             await self._dump_page("no_edit_profile_btn")
@@ -673,13 +677,12 @@ class SnappAgent:
         return False
 
     async def _fill_affiliation_autocomplete(self, value: str) -> bool:
-        """Fill the affiliation field using manual typing to trigger autocomplete.
+        """Fill the affiliation field by clicking 'Add manually' directly.
 
-        Flow:
-          1. Type affiliation name → autocomplete dropdown appears
-          2. If match found → click it
-          3. If no match → scroll dropdown → click 'Add manually'
-          4. After 'Add manually': select country → click 'Add' button
+        Skips the autocomplete search — goes straight to manual entry:
+          1. Click the affiliation input to activate it
+          2. Click 'Add manually' immediately
+          3. Type affiliation name → select country → click 'Add'
         """
         assert self.page is not None
         # Try the known SNAPP ID first, then label-based fallbacks
@@ -701,68 +704,65 @@ class SnappAgent:
                 logger.warning("Affiliation field not found")
                 return False
 
-        # Scroll into view (may be below modal fold)
+        # Click the field to activate it, then type to trigger the dropdown
         await loc.first.evaluate("el => el.scrollIntoView({block: 'center'})")
         await loc.first.click()
         await loc.first.clear()
-        await human_delay(0.1, 0.2)
-
-        # Type character by character to trigger SNAPP autocomplete JS
+        # Use manual typing (press_sequentially) — not paste
         await loc.first.press_sequentially(value, delay=30)
         logger.info("Typed affiliation: '%s'", value)
+        await human_delay(1.0, 1.5)
 
-        # Wait for suggestions to appear
-        await human_delay(1.5, 2.5)
+        # Scroll the dropdown to reveal "Add manually" at the bottom
+        # The dropdown is a list that appears after typing — try scrolling
+        # any scrollable container near the affiliation input
+        try:
+            await loc.first.evaluate("""
+                el => {
+                    // Find the nearest scrollable dropdown sibling/child
+                    const parent = el.closest('[data-component-institution]') || el.parentElement;
+                    if (!parent) return;
+                    const lists = parent.querySelectorAll('ul, ol, [class*="list"], [class*="dropdown"], [class*="autocomplete"]');
+                    for (const list of lists) {
+                        list.scrollTo(0, list.scrollHeight);
+                    }
+                    // Also try scrolling the parent itself
+                    parent.scrollTo(0, parent.scrollHeight);
+                }
+            """)
+            await human_delay(0.5, 0.8)
+            logger.info("Scrolled dropdown container to reveal 'Add manually'")
+        except Exception:
+            pass
 
-        # Try to click a matching suggestion from the dropdown
-        suggestion = (
-            self.page.get_by_role("option", name=value)
-            .or_(self.page.locator("li, .autocomplete-suggestion, [class*='suggestion']").filter(has_text=value))
-        )
-        if await suggestion.count() > 0:
-            try:
-                await suggestion.first.click()
-                logger.info("Selected affiliation from suggestions: '%s'", value)
-                return True
-            except Exception:
-                logger.warning("Could not click suggestion — will try 'Add manually'")
-
-        # No exact match — scroll dropdown and click "Add manually"
-        logger.info("Affiliation not in suggestions — looking for 'Add manually'")
-
-        # Scroll the dropdown container to reveal "Add manually" at the bottom
-        dropdown = (
-            self.page.locator("[class*='autocomplete'], [class*='dropdown'], [class*='suggestion']")
-            .or_(self.page.locator("[data-component-institution-autocomplete]")
-            .or_(self.page.locator(".c-institution")))
-        )
-        if await dropdown.count() > 0:
-            try:
-                await dropdown.first.evaluate("el => el.scrollTo(0, el.scrollHeight)")
-                await human_delay(0.3, 0.5)
-            except Exception:
-                pass
-
-        # Click "Add manually"
+        # Click "Add manually" directly — skip autocomplete search
         add_manually = (
             self.page.get_by_text("Add manually", exact=False)
             .or_(self.page.get_by_role("button", name="Add manually"))
             .or_(self.page.get_by_role("link", name="Add manually"))
+            .or_(self.page.locator("a").filter(has_text="Add manually"))
             .or_(self.page.locator("[class*='add-manual'], [data-component*='manual']"))
         )
         if await add_manually.count() > 0:
             try:
                 await add_manually.first.scroll_into_view_if_needed()
-                await human_delay(0.2, 0.3)
                 await human_click(add_manually.first)
-                logger.info("Clicked 'Add manually'")
-                await human_delay(0.5, 1.0)
+                logger.info("Clicked 'Add manually' for affiliation")
+                await human_delay(0.3, 0.5)
 
-                # After clicking "Add manually", a form appears:
-                # The affiliation name should already be filled from typing.
-                # We need to: 1) Select country  2) Click "Add" button
+                # Now fill the institution name in the manual input field
+                manual_input = (
+                    self.page.locator("#addEditorInstitutionName")
+                    .or_(self.page.locator("#editEditorInstitutionName"))
+                    .or_(self.page.get_by_label("Institution name"))
+                    .or_(self.page.get_by_placeholder("Institution name"))
+                )
+                if await manual_input.count() > 0:
+                    await manual_input.first.clear()
+                    await manual_input.first.press_sequentially(value, delay=30)
+                    logger.info("Typed manual affiliation: '%s'", value)
 
-                # Select country from the dropdown in the manual-add form
+                # Select country from the dropdown
                 country = self.request.get("_country", "").strip()
                 if country:
                     country_select = (
@@ -774,7 +774,7 @@ class SnappAgent:
                     if await country_select.count() > 0:
                         try:
                             await country_select.first.select_option(label=country)
-                            logger.info("Selected country in manual affiliation: '%s'", country)
+                            logger.info("Selected country: '%s'", country)
                         except Exception:
                             # JS fallback for hidden selects
                             await country_select.first.evaluate(
@@ -799,7 +799,7 @@ class SnappAgent:
                 if await add_btn.count() > 0:
                     await human_click(add_btn.first)
                     logger.info("Clicked 'Add' to confirm affiliation: '%s'", value)
-                    await human_delay(0.5, 1.0)
+                    await human_delay(0.3, 0.5)
                 else:
                     logger.warning("'Add' button not found after 'Add manually'")
 
@@ -807,7 +807,10 @@ class SnappAgent:
             except Exception as exc:
                 logger.warning("Error in 'Add manually' flow: %s", exc)
 
-        logger.info("No suggestion match and no 'Add manually' — typed value stays: '%s'", value)
+        # Fallback: just type the value in the field
+        logger.info("'Add manually' not found — typing value directly: '%s'", value)
+        await loc.first.clear()
+        await loc.first.fill(value)
         return True
 
     async def _select_role_radio(self, role: str) -> bool:
@@ -849,33 +852,122 @@ class SnappAgent:
             return False
 
     async def _fill_board_sections(self, sections_csv: str) -> None:
-        """Handle the Board section dropdown (select for each comma-separated value)."""
+        """Handle the Board section autocomplete widget.
+
+        The SNAPP section widget has:
+          - A visible text input: #addEditorBoardSectionJS (type to search)
+          - A hidden multi-select: #addEditorBoardSection (native <select>)
+        Strategy: type in the text input, wait for autocomplete suggestion, click it.
+        Fallback: select directly on the hidden <select> via JS.
+        """
         assert self.page is not None
         sections = [s.strip() for s in sections_csv.split(",") if s.strip()]
         if not sections:
             return
         logger.info("Filling board sections: %s", sections)
-        board_box = (
-            self.page.get_by_label("Board section")
-            .or_(self.page.get_by_text("Please select section"))
-            .or_(self.page.get_by_role("combobox", name="Board section"))
+
+        # Find the visible autocomplete input
+        section_input = (
+            self.page.locator("#addEditorBoardSectionJS")
+            .or_(self.page.locator("input[data-component-sections-input]"))
+            .or_(self.page.locator("input[placeholder*='search and add sections']"))
         )
-        if await board_box.count() == 0:
-            logger.warning("Board section field not found — skipping")
+
+        # Find the hidden native <select>
+        section_select = (
+            self.page.locator("#addEditorBoardSection")
+            .or_(self.page.locator("select[data-component-sections-list]"))
+            .or_(self.page.locator("select[name='sections[]']"))
+        )
+
+        has_input = await section_input.count() > 0
+        has_select = await section_select.count() > 0
+
+        if not has_input and not has_select:
+            logger.warning("Board section fields not found — skipping")
             return
+
         for section in sections:
-            await human_click(board_box.first)
-            await human_delay(0.5, 1.0)
-            option = (
-                self.page.get_by_role("option", name=section)
-                .or_(self.page.get_by_text(section, exact=False))
-            )
-            if await option.count() > 0:
-                await human_click(option.first)
-                logger.info("  Selected section: '%s'", section)
-            else:
-                logger.warning("  Section '%s' not found in dropdown", section)
-            await human_delay(0.5, 1.0)
+            added = False
+
+            # Strategy 1: Type in the autocomplete input and click the suggestion
+            if has_input:
+                try:
+                    await section_input.first.evaluate("el => el.scrollIntoView({block: 'center'})")
+                    await section_input.first.click(timeout=5000)
+                    await human_delay(0.2, 0.3)
+
+                    # Clear any existing text
+                    await self.page.keyboard.press("Control+a")
+                    await self.page.keyboard.press("Backspace")
+
+                    # Type the section name to trigger autocomplete
+                    for ch in section:
+                        await self.page.keyboard.type(ch, delay=random.randint(30, 60))
+                    await human_delay(0.8, 1.2)
+
+                    # Look for the suggestion in the autocomplete dropdown
+                    suggestion = (
+                        self.page.locator(".c-sections-select__item, .c-sections-select li, .autocomplete-suggestion")
+                        .filter(has_text=section)
+                        .or_(self.page.get_by_text(section, exact=True))
+                    )
+
+                    # Filter out already-selected tags
+                    sugg_count = await suggestion.count()
+                    for i in range(sugg_count):
+                        el = suggestion.nth(i)
+                        # Skip if it's inside a tag or selected item
+                        is_tag = await el.evaluate(
+                            """el => {
+                                let node = el;
+                                while (node) {
+                                    const cls = (node.className || '').toString().toLowerCase();
+                                    if (cls.includes('tag') || cls.includes('selected') || cls.includes('badge'))
+                                        return true;
+                                    node = node.parentElement;
+                                }
+                                return false;
+                            }"""
+                        )
+                        if not is_tag:
+                            await human_click(el)
+                            logger.info("  Selected section: '%s' (autocomplete)", section)
+                            added = True
+                            await human_delay(0.3, 0.5)
+                            break
+
+                    if not added:
+                        # Try pressing Enter
+                        await self.page.keyboard.press("Enter")
+                        await human_delay(0.3, 0.5)
+                        added = True
+                        logger.info("  Selected section: '%s' (Enter key)", section)
+
+                except Exception as exc:
+                    logger.warning("  Section autocomplete failed for '%s': %s", section, exc)
+
+            # Strategy 2: Fallback to JS on the hidden <select>
+            if not added and has_select:
+                try:
+                    result = await section_select.first.evaluate(
+                        """(sel, name) => {
+                            for (const opt of sel.options) {
+                                if (opt.textContent.trim().toLowerCase() === name.toLowerCase()) {
+                                    opt.selected = true;
+                                    sel.dispatchEvent(new Event('change', {bubbles: true}));
+                                    return true;
+                                }
+                            }
+                            return false;
+                        }""", section
+                    )
+                    if result:
+                        logger.info("  Selected section: '%s' (JS select)", section)
+                    else:
+                        logger.warning("  Section '%s' not found in options", section)
+                except Exception as exc:
+                    logger.warning("  Section JS fallback failed for '%s': %s", section, exc)
 
     # ── Keyword / Tag management ──────────────────────────────────────────
 
@@ -895,43 +987,130 @@ class SnappAgent:
                 await self._add_single_keyword(keyword)
 
     async def _add_single_keyword(self, keyword: str) -> bool:
-        """Type a keyword in the Tags input and select from suggestions."""
+        """Type a keyword in the Tags input and select from suggestions.
+
+        IMPORTANT: Only look for suggestions inside the autocomplete dropdown,
+        never match on existing tag elements (which would remove them on click).
+        Skips keywords that are already present as tags.
+        """
         assert self.page is not None
         try:
-            # Use the visible keyword input, NOT the hidden input[name='keywords']
+            # ── Check if keyword already exists as a tag ──────────────
+            existing_tags = self.page.locator(
+                ".tagify__tag, "
+                ".tag, "
+                "[class*='keyword-tag'], "
+                "#keywords-autocomplete-holder .tag, "
+                "[data-component-keyword-tag]"
+            )
+            tag_count = await existing_tags.count()
+            for i in range(tag_count):
+                tag_text = (await existing_tags.nth(i).inner_text()).strip().lower()
+                # Tags may include an "x" or "×" remove button text — strip it
+                tag_text = tag_text.replace("×", "").replace("x", "").strip()
+                if tag_text == keyword.lower().strip():
+                    logger.info("  Keyword '%s' already exists — skipping", keyword)
+                    return True
+
+            # ── Find the tag input field ──────────────────────────────
+            # NOTE: Tagify hides the original <input> and creates a .tagify
+            # wrapper with .tagify__input inside. Target the visible Tagify
+            # input FIRST, then fall back to raw input IDs.
             tag_input = (
-                self.page.locator("#addEditorKeywords")
+                self.page.locator(".tagify__input")
+                .or_(self.page.locator("[data-component-keywords-input]"))
                 .or_(self.page.locator("#keywords-autocomplete-holder input[type='text']"))
-                .or_(self.page.locator(".tagify__input"))
                 .or_(self.page.get_by_placeholder("Add a tag"))
-                .or_(self.page.get_by_label("Tags"))
+                .or_(self.page.locator("#addEditorkeywords"))
+                .or_(self.page.locator("#addEditorKeywords"))
+                .or_(self.page.locator("#editEditorKeywords"))
+                .or_(self.page.locator("#editEditorkeywords"))
             )
             if await tag_input.count() == 0:
                 logger.warning("Tags input not found on page")
                 return False
 
-            # Scroll into view and click via JS (element may be below modal fold)
-            await tag_input.first.evaluate("el => { el.scrollIntoView({block: 'center'}); el.focus(); el.click(); }")
-            await human_delay(0.2, 0.4)
-            # Type the keyword
-            for ch in keyword:
-                await self.page.keyboard.type(ch, delay=random.randint(30, 80))
-            await human_delay(1.0, 1.5)
-
-            # Look for a suggestion matching this keyword
-            suggestion = (
-                self.page.get_by_role("option", name=keyword)
-                .or_(self.page.get_by_text(keyword, exact=True))
+            # Scroll into view, clear any leftover text, and focus
+            await tag_input.first.evaluate(
+                "el => { el.scrollIntoView({block: 'center'}); el.value = ''; }"
             )
-            if await suggestion.count() > 0:
-                await human_click(suggestion.first)
-                logger.info("  Added keyword: '%s'", keyword)
-                await human_delay(0.5, 1.0)
-                return True
+            await tag_input.first.click(timeout=5000)
+            await human_delay(0.2, 0.3)
 
-            # Clear the typed text if not found
+            # Select all and delete any residual text in the input
             await self.page.keyboard.press("Control+a")
             await self.page.keyboard.press("Backspace")
+            await human_delay(0.1, 0.2)
+
+            # Type the keyword character by character to trigger autocomplete
+            for ch in keyword:
+                await self.page.keyboard.type(ch, delay=random.randint(30, 60))
+            await human_delay(1.0, 1.5)
+
+            # Look for a matching suggestion in the autocomplete dropdown.
+            # Strategy: try Tagify dropdown items first (most common), then
+            # CSS selectors, then broad text match. Skip role="option" as it
+            # matches hidden <option> elements in the collection <select>.
+
+            # 1. Try Tagify dropdown items (the actual visible suggestions)
+            dropdown_suggestion = (
+                self.page.locator(
+                    ".tagify__dropdown__item, "
+                    "#keywords-autocomplete-holder li, "
+                    "[class*='autocomplete-list'] li, "
+                    "[class*='autocomplete'] li, "
+                    "ul.autocomplete li"
+                ).filter(has_text=keyword)
+            )
+            if await dropdown_suggestion.count() > 0:
+                await human_click(dropdown_suggestion.first)
+                logger.info("  Added keyword: '%s' (dropdown)", keyword)
+                await human_delay(0.3, 0.5)
+                return True
+
+            # 2. Broad text match, but EXCLUDE existing tags and their children
+            #    Tags have classes like .tag, .tagify__tag, or are inside
+            #    .keywords-tag-holder. We only want suggestion/autocomplete items.
+            all_text_matches = self.page.get_by_text(keyword, exact=True)
+            match_count = await all_text_matches.count()
+            for i in range(match_count):
+                el = all_text_matches.nth(i)
+                # Check if this element is inside a tag (existing keyword) — skip it
+                is_tag = await el.evaluate(
+                    """el => {
+                        let node = el;
+                        while (node) {
+                            const cls = (node.className || '').toString().toLowerCase();
+                            if (cls.includes('tag') && !cls.includes('autocomplete') && !cls.includes('dropdown'))
+                                return true;
+                            node = node.parentElement;
+                        }
+                        return false;
+                    }"""
+                )
+                if not is_tag:
+                    await human_click(el)
+                    logger.info("  Added keyword: '%s' (text match)", keyword)
+                    await human_delay(0.3, 0.5)
+                    return True
+
+            # 3. If no match, try pressing Enter to submit the typed keyword
+            await self.page.keyboard.press("Enter")
+            await human_delay(0.3, 0.5)
+
+            # Check if a tag was actually added by looking for it in the tag container
+            tag_elements = self.page.locator(
+                ".tagify__tag, .tag, [class*='keyword-tag']"
+            ).filter(has_text=keyword)
+            if await tag_elements.count() > 0:
+                logger.info("  Added keyword via Enter: '%s'", keyword)
+                return True
+
+            # Clear the typed text if nothing worked
+            await tag_input.first.click()
+            await self.page.keyboard.press("Control+a")
+            await self.page.keyboard.press("Backspace")
+            logger.warning("  Keyword '%s' not found in suggestions", keyword)
             return False
 
         except Exception as exc:
@@ -945,7 +1124,7 @@ class SnappAgent:
         try:
             # Open in a new tab
             new_page = await self.context.new_page()
-            await new_page.goto(INTERNAL_KEYWORDS_URL, wait_until="domcontentloaded", timeout=30_000)
+            await new_page.goto(INTERNAL_KEYWORDS_URL, wait_until="domcontentloaded", timeout=5_000)
             await human_delay(2, 4)
 
             # Find the keyword input and add button
@@ -1023,14 +1202,9 @@ class SnappAgent:
                 onboarding_date, unavail_from, unavail_to,
             )
 
-            # The unavailability dates are on the NEXT wizard step (Step 3).
-            # Click Next to advance to the step with date fields.
-            logger.info("[ONBOARD-UNAVAIL] Clicking Next to reach unavailability step")
-            if await self._click_next():
-                await self.set_unavailability(unavail_from, unavail_to)
-            else:
-                logger.warning("[ONBOARD-UNAVAIL] No Next button — trying to set dates on current page")
-                await self.set_unavailability(unavail_from, unavail_to)
+            # The unavailability dates are on the SAME page as roles/keywords
+            # (Step 2). No need to click Next — just scroll down and fill.
+            await self.set_unavailability(unavail_from, unavail_to)
 
         except Exception as exc:
             logger.warning(
@@ -1082,8 +1256,14 @@ class SnappAgent:
         assert self.page is not None
         logger.info("Setting unavailability: %s to %s", from_date, to_date)
         try:
-            from_val = self._normalize_date(from_date)
-            to_val = self._normalize_date(to_date)
+            from_val = self._normalize_date(from_date)  # YYYY-MM-DD
+            to_val = self._normalize_date(to_date)       # YYYY-MM-DD
+
+            # Also prepare dd/mm/yyyy format for text-type inputs
+            from_parts = from_val.split("-")  # ['YYYY', 'MM', 'DD']
+            to_parts = to_val.split("-")
+            from_dmy = f"{from_parts[2]}/{from_parts[1]}/{from_parts[0]}"
+            to_dmy = f"{to_parts[2]}/{to_parts[1]}/{to_parts[0]}"
 
             # Try all known IDs (edit form + add form) plus name fallback
             from_input = (
@@ -1102,40 +1282,48 @@ class SnappAgent:
                 await self._dump_page("no_date_pickers")
                 return False
 
-            # Check if the element is visible
-            is_visible = await from_input.first.is_visible()
+            # Scroll into view using JS (avoids the scroll_into_view_if_needed timeout)
+            await from_input.first.evaluate("el => el.scrollIntoView({block: 'center'})")
+            await human_delay(0.3, 0.5)
 
-            if is_visible:
-                # Standard approach: click + fill
-                await from_input.first.evaluate("el => el.scrollIntoView({block: 'center'})")
-                await human_delay(0.3, 0.5)
+            # Determine input type to choose the right format
+            input_type = await from_input.first.get_attribute("type") or "text"
+            logger.info("Unavailability input type: '%s'", input_type)
 
-                await from_input.first.click()
-                await human_delay(0.3, 0.5)
-                await from_input.first.fill(from_val)
-                logger.info("Filled 'From' date: %s", from_val)
-                await human_delay(0.5, 1.0)
-
-                await to_input.first.click()
-                await human_delay(0.3, 0.5)
-                await to_input.first.fill(to_val)
-                logger.info("Filled 'To' date: %s", to_val)
-                await human_delay(0.5, 1.0)
+            if input_type == "date":
+                # type="date" expects YYYY-MM-DD
+                fill_from, fill_to = from_val, to_val
             else:
-                # Element exists but is hidden — use JS directly
-                logger.info("Date fields not visible — setting values via JS")
+                # type="text" with dd/mm/yyyy placeholder
+                fill_from, fill_to = from_dmy, to_dmy
+
+            # Fill the From date
+            await from_input.first.click(timeout=5000)
+            await human_delay(0.2, 0.3)
+            await from_input.first.fill(fill_from)
+            logger.info("Filled 'From' date: %s", fill_from)
+            await human_delay(0.3, 0.5)
+
+            # Fill the To date
+            await to_input.first.evaluate("el => el.scrollIntoView({block: 'center'})")
+            await to_input.first.click(timeout=5000)
+            await human_delay(0.2, 0.3)
+            await to_input.first.fill(fill_to)
+            logger.info("Filled 'To' date: %s", fill_to)
+            await human_delay(0.3, 0.5)
 
             # Verify/force values via JS (works for both visible and hidden)
             actual_from = await from_input.first.evaluate("el => el.value")
             actual_to = await to_input.first.evaluate("el => el.value")
-            if actual_from != from_val or actual_to != to_val:
+            if not actual_from or not actual_to:
+                # Force via JS with both formats
                 await from_input.first.evaluate(
-                    f"el => {{ el.value = '{from_val}'; el.dispatchEvent(new Event('change', {{bubbles: true}})); }}"
+                    f"el => {{ el.value = '{from_val}'; el.dispatchEvent(new Event('change', {{bubbles: true}})); el.dispatchEvent(new Event('input', {{bubbles: true}})); }}"
                 )
                 await to_input.first.evaluate(
-                    f"el => {{ el.value = '{to_val}'; el.dispatchEvent(new Event('change', {{bubbles: true}})); }}"
+                    f"el => {{ el.value = '{to_val}'; el.dispatchEvent(new Event('change', {{bubbles: true}})); el.dispatchEvent(new Event('input', {{bubbles: true}})); }}"
                 )
-                logger.info("Set dates via JS: %s to %s", from_val, to_val)
+                logger.info("Set dates via JS fallback: %s to %s", from_val, to_val)
 
             logger.info("Unavailability dates filled successfully")
             return True
@@ -1164,18 +1352,107 @@ class SnappAgent:
         logger.warning("Could not parse date '%s' — using as-is", date_str)
         return date_str
 
+    # ── Handle existing editor profile ─────────────────────────────────
+
+    async def _handle_existing_editor_profile(self, requested_affiliation: str) -> bool:
+        """Handle the case where an editor profile already exists in the system.
+
+        When the system detects an existing editor, it shows pre-filled info
+        with existing affiliations and 'Remove' buttons. This method:
+          1. Detects the existing profile (via 'Remove' button or 'already exists' text)
+          2. Removes all existing affiliations
+          3. Adds the requested affiliation via 'Add manually'
+          4. Clicks Next to advance to Step 2
+
+        Returns True if existing profile was handled, False if not detected.
+        """
+        assert self.page is not None
+
+        # Detect existing editor via page text
+        page_text = await self.page.inner_text("body")
+        has_exists_text = "already exists" in page_text.lower()
+
+        if not has_exists_text:
+            return False
+
+        logger.info("Existing editor profile detected — handling affiliations")
+
+        # Step 1: Remove ALL existing affiliations
+        # Try multiple locator strategies since "Remove" could be:
+        # <button>, <input type="button">, <a>, or any element with role="button"
+        remove_locator = (
+            self.page.get_by_role("button", name="Remove")
+            .or_(self.page.locator("button").filter(has_text="Remove"))
+            .or_(self.page.locator("input[value='Remove']"))
+            .or_(self.page.locator("a").filter(has_text="Remove"))
+            .or_(self.page.locator("[data-action='remove']"))
+        )
+
+        remove_count = await remove_locator.count()
+        logger.info("Found %d Remove element(s) via combined locator", remove_count)
+
+        if remove_count == 0:
+            # Last resort: find any clickable element with text "Remove"
+            all_remove = self.page.get_by_text("Remove", exact=True)
+            remove_count = await all_remove.count()
+            logger.info("Found %d 'Remove' text elements (fallback)", remove_count)
+            for i in range(remove_count):
+                try:
+                    await all_remove.first.click()
+                    await human_delay(0.5, 0.8)
+                    logger.info("Removed existing affiliation %d/%d (text click)", i + 1, remove_count)
+                except Exception as exc:
+                    logger.warning("Error removing affiliation %d: %s", i + 1, exc)
+        else:
+            for i in range(remove_count):
+                try:
+                    # Always click .first since list shrinks after each removal
+                    await remove_locator.first.click()
+                    await human_delay(0.5, 0.8)
+                    logger.info("Removed existing affiliation %d/%d", i + 1, remove_count)
+                except Exception as exc:
+                    logger.warning("Error removing affiliation %d: %s", i + 1, exc)
+
+        # Step 2: Add the requested affiliation via 'Add manually'
+        if requested_affiliation:
+            await self._fill_affiliation_autocomplete(requested_affiliation)
+            logger.info("Added requested affiliation: '%s'", requested_affiliation)
+
+        # Step 3: Click Next to advance to Step 2
+        if not await self._click_next():
+            logger.warning("Next button not found after handling existing editor")
+
+        return True
+
     # ── Click Next (for multi-step forms) ─────────────────────────────────
 
     async def _click_next(self) -> bool:
         assert self.page is not None
         next_btn = (
-            self.page.get_by_role("button", name="Next")
+            self.page.locator("[data-component-wizard-next]")
+            .or_(self.page.get_by_role("button", name="Next"))
             .or_(self.page.get_by_role("button", name="Continue"))
         )
         if await next_btn.count() > 0:
-            await human_click(next_btn.first)
-            await human_delay(2, 4)
+            await next_btn.first.scroll_into_view_if_needed()
+            await human_delay(0.3, 0.5)
+            # Try regular click first
+            try:
+                await next_btn.first.click(timeout=5000)
+            except Exception:
+                # Fallback to JS click if regular click fails
+                logger.info("Regular click on Next failed — trying JS click")
+                await next_btn.first.evaluate("el => el.click()")
+            await human_delay(0.5, 1.0)
             logger.info("Clicked Next")
+            # Wait for step 2 to become visible
+            try:
+                step2 = self.page.locator("text='step 2'")
+                if await step2.count() > 0:
+                    await step2.first.wait_for(state="visible", timeout=5000)
+                    logger.info("Step 2 is now visible")
+            except Exception:
+                pass
             return True
         logger.warning("Next button not found")
         return False
@@ -1347,28 +1624,34 @@ class SnappAgent:
 
         try:
             logger.info("Onboarding new editor (regular)")
-            # The "Add new Editor" is an <a> link with id="add_new_btn"
-            btn = (
-                self.page.locator("#add_new_btn")
-                .or_(self.page.get_by_role("link", name="Add new Editor"))
-                .or_(self.page.get_by_text("Add new Editor", exact=True))
-            )
-            if await btn.count() == 0:
-                logger.error("'Add new Editor' button not found")
-                await self._dump_page("no_add_editor_btn")
-                return False
+            # Get journal ID from request data or from current URL
+            jid = str(int(float(req.get("journal_id", "0"))))
+            if jid == "0":
+                # Fallback: extract from current URL
+                import re as _re
+                jid_match = _re.search(r"/editors/(\d+)", self.page.url)
+                if jid_match:
+                    jid = jid_match.group(1)
+                else:
+                    logger.error("Could not determine journal ID")
+                    return False
+            # Navigate directly to /editors/{jid}/editor/{jid}/add
+            origin = "https://usermanager.nature.com"
+            add_url = f"{origin}/editors/{jid}/editor/{jid}/add"
+            logger.info("Navigating to Add Editor form: %s", add_url)
+            await self.page.goto(add_url, wait_until="domcontentloaded", timeout=30_000)
+            await human_delay(2, 3)
 
-            await human_click(btn.first)
-            # Wait for the Add Editor page/modal to load
+            # Verify the form page loaded
+            logger.info("After navigation — URL: %s", self.page.url)
             try:
-                await self.page.wait_for_load_state("domcontentloaded", timeout=15_000)
+                await self.page.locator("#addEditorPrimaryEmail").wait_for(
+                    state="visible", timeout=10_000
+                )
+                logger.info("Add Editor form loaded successfully")
             except Exception:
-                pass
-            await human_delay(3, 5)
-
-            # Diagnostic dump — capture the Add Editor form HTML
-            await self._dump_page("add_editor_form")
-            logger.info("Add Editor form loaded — URL: %s", self.page.url)
+                logger.warning("Email field not visible — form may not have loaded")
+                await self._dump_page("add_editor_form_failed")
 
             # ── Step 1: Personal information ──────────────────────────
             email = req.get("email", "").strip()
@@ -1379,40 +1662,59 @@ class SnappAgent:
                 if not filled:
                     logger.warning("Could not fill email field — dumping page")
                     await self._dump_page("onboard_email_field_not_found")
+                else:
+                    # Press Tab to trigger email lookup (server checks if editor exists)
+                    try:
+                        email_field = self.page.locator("#addEditorPrimaryEmail")
+                        if await email_field.count() > 0:
+                            await email_field.press("Tab")
+                            # Click given name field to trigger blur
+                            given_name_field = self.page.locator("#addEditorGivenName")
+                            if await given_name_field.count() > 0:
+                                await given_name_field.click()
+                    except Exception:
+                        pass
 
-            # Name fields
-            fname = req.get("first_name", "").strip()
-            lname = req.get("last_name", "").strip()
-            if not fname and not lname:
-                fname, lname = parse_editor_name(req.get("editor_name", ""))
+            # Wait for system to detect if editor already exists (server lookup)
+            await human_delay(4, 5)
 
-            if fname:
-                filled = await self._fill_field_by_labels(["Given name", "First name"], fname)
-                if not filled:
-                    logger.warning("Could not fill first name field")
-            if lname:
-                filled = await self._fill_field_by_labels(["Family name", "Last name", "Surname"], lname)
-                if not filled:
-                    logger.warning("Could not fill last name field")
-
-            # Affiliation
+            # Check for existing editor profile
             affiliation = req.get("affiliation", "").strip()
-            if affiliation:
-                # Try multiple common labels since exact label is unknown
-                filled = await self._fill_field_by_labels(
-                    ["Affiliation", "Institution", "Organization", "Search affiliations", "University"], 
-                    affiliation
-                )
-                if not filled:
-                    # Fallback to autocomplete logic if a specific search field is found
-                    filled = await self._fill_affiliation_autocomplete(affiliation)
-                if not filled:
-                    logger.warning("Affiliation field not found — continuing without it")
+            existing_handled = await self._handle_existing_editor_profile(affiliation)
 
-            # Click Next to step 2
-            if not await self._click_next():
-                logger.warning("'Next' button not found — trying to continue anyway")
-                await self._dump_page("onboard_no_next_btn")
+            if not existing_handled:
+                # Normal flow — fill name fields and affiliation
+                # Name fields
+                fname = req.get("first_name", "").strip()
+                lname = req.get("last_name", "").strip()
+                if not fname and not lname:
+                    fname, lname = parse_editor_name(req.get("editor_name", ""))
+
+                if fname:
+                    filled = await self._fill_field_by_labels(["Given name", "First name"], fname)
+                    if not filled:
+                        logger.warning("Could not fill first name field")
+                if lname:
+                    filled = await self._fill_field_by_labels(["Family name", "Last name", "Surname"], lname)
+                    if not filled:
+                        logger.warning("Could not fill last name field")
+
+                # Affiliation — go directly to 'Add manually' (skip autocomplete search)
+                if affiliation:
+                    filled = await self._fill_affiliation_autocomplete(affiliation)
+                    if not filled:
+                        logger.warning("Affiliation field not found — continuing without it")
+
+                # Click Next to step 2
+                if not await self._click_next():
+                    logger.warning("'Next' button not found — trying to continue anyway")
+                    await self._dump_page("onboard_no_next_btn")
+
+                # After clicking Next, check again for existing editor
+                await human_delay(1, 1.5)
+                existing_handled_after_next = await self._handle_existing_editor_profile(affiliation)
+                if existing_handled_after_next:
+                    logger.info("Existing editor detected after Next click — handled")
 
             # ── Step 2: Journal-specific information ──────────────────
             role = req.get("role", "").strip()
@@ -1452,29 +1754,32 @@ class SnappAgent:
 
         try:
             logger.info("Onboarding guest editor (collection: '%s')", collection)
-            btn = (
-                self.page.locator("#add_new_guest_btn")
-                .or_(self.page.get_by_role("link", name="Add Guest Editor"))
-                .or_(self.page.get_by_text("Add Guest Editor"))
-            )
-            if await btn.count() == 0:
-                logger.error("'Add Guest Editor' button not found")
-                await self._dump_page("no_add_guest_btn")
-                return False
+            # Get journal ID from request data or from current URL
+            jid = str(int(float(req.get("journal_id", "0"))))
+            if jid == "0":
+                import re as _re
+                jid_match = _re.search(r"/editors/(\d+)", self.page.url)
+                if jid_match:
+                    jid = jid_match.group(1)
+                else:
+                    logger.error("Could not determine journal ID")
+                    return False
+            origin = "https://usermanager.nature.com"
+            add_url = f"{origin}/editors/{jid}/guest-editor/{jid}/add"
+            logger.info("Navigating to Add Guest Editor form: %s", add_url)
+            await self.page.goto(add_url, wait_until="domcontentloaded", timeout=30_000)
+            await human_delay(2, 3)
 
-            logger.info("Clicking 'Add Guest Editor' button (opens modal)")
-            await human_click(btn.first)
-
-            # Wait for modal form
+            # Verify the form page loaded
+            logger.info("After navigation — URL: %s", self.page.url)
             try:
                 await self.page.locator("#addEditorPrimaryEmail").wait_for(
-                    state="visible", timeout=15_000
+                    state="visible", timeout=10_000
                 )
-                logger.info("Guest Editor modal loaded")
+                logger.info("Guest Editor form loaded successfully")
             except Exception:
-                logger.warning("Email field not visible after 15s")
-
-            await self._dump_page("guest_editor_form")
+                logger.warning("Email field not visible — form may not have loaded")
+                await self._dump_page("guest_editor_form_failed")
 
             # ── Step 1: Editor personal information ───────────────────
 
@@ -1482,6 +1787,8 @@ class SnappAgent:
             email = req.get("email", "").strip()
             if email:
                 await self._fill_by_id("addEditorPrimaryEmail", email)
+                # Press Tab to trigger email lookup (server checks if editor exists)
+                await self.page.locator("#addEditorPrimaryEmail").press("Tab")
                 logger.info("Filled email: '%s'", email)
             else:
                 logger.warning(
@@ -1490,26 +1797,49 @@ class SnappAgent:
                     req.get("_ticket_id", "?"), req.get("editor_name", "?")
                 )
 
-            # 2. Given Name & Family Name (using exact SNAPP IDs)
-            fname = req.get("first_name", "").strip()
-            lname = req.get("last_name", "").strip()
-            if not fname and not lname:
-                fname, lname = parse_editor_name(req.get("editor_name", ""))
-            if fname:
-                await self._fill_by_id("addEditorGivenName", fname)
-            if lname:
-                await self._fill_by_id("addEditorFamilyName", lname)
+            # Wait for system to detect if editor already exists (server lookup)
+            # Press Tab and click given name field to trigger blur on email
+            try:
+                await self.page.locator("#addEditorPrimaryEmail").press("Tab")
+                given_name_field = self.page.locator("#addEditorGivenName")
+                if await given_name_field.count() > 0:
+                    await given_name_field.click()
+            except Exception:
+                pass
+            await human_delay(4, 5)
 
-            # 3. Affiliation
+            # Check for existing editor profile
             affiliation = req.get("affiliation", "").strip()
-            if affiliation:
-                await self._fill_affiliation_autocomplete(affiliation)
+            existing_handled = await self._handle_existing_editor_profile(affiliation)
 
-            # ── Click Next to advance to Step 2 ──────────────────────
-            logger.info("Clicking 'Next' to advance to Step 2 of 2")
-            if not await self._click_next():
-                logger.warning("'Next' button not found on guest editor form — trying to continue")
-                await self._dump_page("guest_onboard_no_next_btn")
+            if not existing_handled:
+                # Normal flow — fill name fields and affiliation
+                # 2. Given Name & Family Name (using exact SNAPP IDs)
+                fname = req.get("first_name", "").strip()
+                lname = req.get("last_name", "").strip()
+                if not fname and not lname:
+                    fname, lname = parse_editor_name(req.get("editor_name", ""))
+                if fname:
+                    await self._fill_by_id("addEditorGivenName", fname)
+                if lname:
+                    await self._fill_by_id("addEditorFamilyName", lname)
+
+                # 3. Affiliation
+                if affiliation:
+                    await self._fill_affiliation_autocomplete(affiliation)
+
+                # ── Click Next to advance to Step 2 ──────────────────────
+                logger.info("Clicking 'Next' to advance to Step 2 of 2")
+                if not await self._click_next():
+                    logger.warning("'Next' button not found on guest editor form — trying to continue")
+                    await self._dump_page("guest_onboard_no_next_btn")
+
+                # After clicking Next, the page might NOW show existing editor
+                # (some forms detect existing editors on Next click)
+                await human_delay(1, 1.5)
+                existing_handled_after_next = await self._handle_existing_editor_profile(affiliation)
+                if existing_handled_after_next:
+                    logger.info("Existing editor detected after Next click — handled")
 
             # ── Step 2: Journal-specific information ──────────────────
 
@@ -1526,10 +1856,10 @@ class SnappAgent:
                 try:
                     await collection_select.evaluate("el => el.scrollIntoView({block: 'center'})")
                     if collection_id:
-                        await collection_select.select_option(value=collection_id)
+                        await collection_select.select_option(value=collection_id, timeout=5000)
                         logger.info("Selected collection by value: '%s'", collection_id)
                     else:
-                        await collection_select.select_option(label=collection)
+                        await collection_select.select_option(label=collection, timeout=5000)
                         logger.info("Selected collection by label: '%s'", collection)
                 except Exception as exc:
                     logger.warning("select_option failed -- using JS: %s", exc)
