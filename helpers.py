@@ -23,9 +23,15 @@ T = TypeVar("T")
 # Human-like helpers (stealth)
 # ──────────────────────────────────────────────────────────────────────────────
 
+# Global speed factor: 1.0 = normal, 0.25 = 4x faster (bulk mode)
+SPEED_FACTOR: float = 1.0
+
+
 async def human_delay(low: float = 0.05, high: float = 0.15) -> None:
-    """Sleep a tiny amount — just enough for JS to react."""
-    await asyncio.sleep(random.uniform(low, high))
+    """Sleep a tiny amount — just enough for JS to react.
+    Scaled by global SPEED_FACTOR for bulk mode.
+    """
+    await asyncio.sleep(random.uniform(low, high) * SPEED_FACTOR)
 
 
 async def human_type(page: Page, locator, text: str) -> None:

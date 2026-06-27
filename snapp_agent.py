@@ -42,6 +42,7 @@ from playwright.async_api import (
     async_playwright,
 )
 
+import helpers
 from helpers import human_click, human_delay, human_type, parse_editor_name, retry_async
 from smartsheet_reader import SmartsheetReader
 
@@ -441,14 +442,14 @@ class SnappAgent:
         """Wait for the journal page to finish loading after selecting a journal."""
         assert self.page is not None
         try:
-            await self.page.wait_for_load_state("networkidle", timeout=15_000)
+            await self.page.wait_for_load_state("domcontentloaded", timeout=5_000)
         except Exception:
             pass
-        # Wait for add_new_btn or search_keyword as confirmation
+        # Quick check for editor list elements
         try:
             await self.page.locator("#add_new_btn").or_(
                 self.page.locator("#search_keyword")
-            ).first.wait_for(state="visible", timeout=10_000)
+            ).first.wait_for(state="visible", timeout=5_000)
         except Exception:
             pass
 
@@ -519,20 +520,68 @@ class SnappAgent:
 
     @staticmethod
     def _name_variants(name: str) -> list[str]:
-        """Generate search variations for typo/ordering robustness."""
+        """Generate search variations for typo/ordering/punctuation robustness.
+
+        Tries (in order):
+          1. Original name
+          2. Titles stripped (Dr., Prof., etc.)
+          3. "Last, First"
+          4. "Last First"
+          5. Punctuation/special chars removed (slashes, hyphens, dots)
+          6. First part of slash-separated name (e.g. 'Malik' from 'Malik/KHALID')
+          7. Accents/diacritics removed (e.g. 'Müller' → 'Muller')
+          8. Last name only
+          9. First name only
+        """
+        import re
+        import unicodedata
+
         variants: list[str] = [name]
+
+        # Strip academic titles
         clean = name
         for title in ("Dr.", "Prof.", "Mr.", "Mrs.", "Ms.", "Sir", "Dr", "Professor"):
             clean = clean.replace(title, "").strip()
         if clean != name:
             variants.append(clean)
+
+        # Handle slash-separated names (e.g. "Haseeba Malik/KHALID")
+        if "/" in clean:
+            # Try the part before the slash
+            before_slash = clean.split("/")[0].strip()
+            if before_slash and before_slash != clean:
+                variants.append(before_slash)
+
+        # Remove all punctuation/special chars (slashes, hyphens, dots, commas)
+        no_punct = re.sub(r"[/\-.,;:()'\"]", " ", clean)
+        no_punct = re.sub(r"\s+", " ", no_punct).strip()
+        if no_punct != clean and no_punct:
+            variants.append(no_punct)
+
+        # Remove accents/diacritics (e.g. ö → o, é → e)
+        try:
+            nfkd = unicodedata.normalize("NFKD", clean)
+            no_accents = "".join(c for c in nfkd if not unicodedata.combining(c))
+            if no_accents != clean and no_accents:
+                variants.append(no_accents)
+        except Exception:
+            pass
+
+        # Split into parts for first/last name variants
         parts = clean.split()
+        # Also try splitting the no-punct version if different
+        if no_punct != clean:
+            parts = no_punct.split() if len(no_punct.split()) >= 2 else parts
+
         if len(parts) >= 2:
             first, last = " ".join(parts[:-1]), parts[-1]
             variants.append(f"{last}, {first}")
             variants.append(f"{last} {first}")
-            variants.append(last)  # last name only as fallback
-        return list(dict.fromkeys(variants))
+            variants.append(last)   # last name only
+            variants.append(first)  # first name only
+
+        # Deduplicate while preserving order
+        return list(dict.fromkeys(v for v in variants if v.strip()))
 
     async def _do_editor_search(self, query: str) -> bool:
         """Execute an editor search within the current journal page."""
@@ -568,31 +617,62 @@ class SnappAgent:
             )
             result_count = await result.count()
             if result_count > 0:
-                # If multiple results, prefer normal account over guest
-                if result_count > 1 and self.request.get("_prefer_normal", False):
-                    logger.info("Multiple results (%d) found — preferring normal (non-guest) account", result_count)
-                    chosen = None
-                    for i in range(result_count):
-                        el = result.nth(i)
-                        # Check if the parent row/card contains "Guest Editor"
-                        try:
-                            parent_text = await el.evaluate("el => el.closest('tr, .card, .editor-row, div')?.textContent || ''")
-                            if "guest editor" in parent_text.lower():
+                # Determine what kind of account the ticket wants
+                ticket_collection = (self.request.get("collection_name") or "").strip()
+                want_guest = bool(ticket_collection)
+                logger.info(
+                    "Search returned %d result(s) — looking for %s account",
+                    result_count,
+                    f"GUEST (collection: '{ticket_collection}')" if want_guest else "NORMAL (non-guest, active)"
+                )
+
+                # Check EVERY result — even a single one — before clicking
+                chosen = None
+                for i in range(result_count):
+                    el = result.nth(i)
+                    try:
+                        # Read the parent row/card text to check account type
+                        parent_text = await el.evaluate(
+                            "el => el.closest('tr, .card, .editor-row, div')?.textContent || ''"
+                        )
+                        ptxt = parent_text.lower()
+
+                        # Check for collection name / "guest editor" → guest account
+                        is_guest = "guest editor" in ptxt or "collection" in ptxt
+                        # Check for deactivated account
+                        is_deactivated = "deactivat" in ptxt
+
+                        if is_deactivated:
+                            logger.info("  Result %d: DEACTIVATED — skipping", i)
+                            continue
+
+                        if want_guest:
+                            # Ticket is for a guest editor — select guest account
+                            if is_guest:
+                                logger.info("  Result %d: GUEST account — selecting (matches ticket)", i)
+                                chosen = el
+                                break
+                            else:
+                                logger.info("  Result %d: NORMAL account — skipping (want guest)", i)
+                        else:
+                            # Ticket is for normal editor — skip guest accounts
+                            if is_guest:
                                 logger.info("  Result %d: GUEST account — skipping", i)
                                 continue
                             else:
-                                logger.info("  Result %d: normal account — selecting", i)
+                                logger.info("  Result %d: NORMAL active account — selecting", i)
                                 chosen = el
                                 break
-                        except Exception:
-                            chosen = el
-                            break
-                    if chosen is None:
-                        logger.warning("All results appear to be guest accounts — using first result")
-                        chosen = result.first
-                    await human_click(chosen)
-                else:
-                    await human_click(result.first)
+                    except Exception:
+                        # If we can't read parent text, use this result
+                        chosen = el
+                        break
+
+                if chosen is None:
+                    logger.warning("No suitable account found among %d results — skipping", result_count)
+                    return False
+
+                await human_click(chosen)
                 await human_delay(1.5, 3)
                 logger.info("Editor found: '%s'", query)
                 return True
@@ -895,15 +975,16 @@ class SnappAgent:
                 try:
                     await section_input.first.evaluate("el => el.scrollIntoView({block: 'center'})")
                     await section_input.first.click(timeout=5000)
-                    await human_delay(0.2, 0.3)
+                    await human_delay(0.1, 0.2)
 
-                    # Clear any existing text
-                    await self.page.keyboard.press("Control+a")
-                    await self.page.keyboard.press("Backspace")
-
-                    # Type the section name to trigger autocomplete
-                    for ch in section:
-                        await self.page.keyboard.type(ch, delay=random.randint(30, 60))
+                    # Use fill() to set the complete section name reliably
+                    # (char-by-char typing was sometimes dropping characters)
+                    await section_input.first.fill(section)
+                    # Dispatch events to trigger autocomplete (different
+                    # custom components may listen on different events)
+                    await section_input.first.dispatch_event("input")
+                    await section_input.first.dispatch_event("keyup")
+                    await section_input.first.dispatch_event("change")
                     await human_delay(0.8, 1.2)
 
                     # Look for the suggestion in the autocomplete dropdown
@@ -971,8 +1052,14 @@ class SnappAgent:
 
     # ── Keyword / Tag management ──────────────────────────────────────────
 
-    async def add_keywords(self, keywords_csv: str) -> None:
-        """Add keywords/tags to the editor's profile one by one."""
+    async def add_keywords(self, keywords_csv: str, *, skip_internal_creation: bool = False) -> None:
+        """Add keywords/tags to the editor's profile one by one.
+
+        Args:
+            keywords_csv: Comma-separated keyword string.
+            skip_internal_creation: If True, do NOT open the internal keywords
+                URL to create missing keywords (avoids new-tab issues in bulk mode).
+        """
         assert self.page is not None
         keywords = [k.strip() for k in keywords_csv.split(",") if k.strip()]
         if not keywords:
@@ -981,132 +1068,139 @@ class SnappAgent:
         for keyword in keywords:
             added = await self._add_single_keyword(keyword)
             if not added:
-                logger.info("Keyword '%s' not in suggestions — creating on internal URL", keyword)
-                await self.create_keyword_on_internal(keyword)
-                # Retry after creation
-                await self._add_single_keyword(keyword)
+                if skip_internal_creation:
+                    logger.warning("Keyword '%s' not in suggestions -- skipping internal creation (bulk mode)", keyword)
+                else:
+                    logger.info("Keyword '%s' not in suggestions -- creating on internal URL", keyword)
+                    await self.create_keyword_on_internal(keyword)
+                    # Brief wait for edit page to be ready after tab switch
+                    await human_delay(0.5, 0.8)
+                    # Retry after creation
+                    retry_ok = await self._add_single_keyword(keyword)
+                    if not retry_ok:
+                        logger.warning("Keyword '%s' still not found after internal creation", keyword)
 
     async def _add_single_keyword(self, keyword: str) -> bool:
         """Type a keyword in the Tags input and select from suggestions.
 
-        IMPORTANT: Only look for suggestions inside the autocomplete dropdown,
-        never match on existing tag elements (which would remove them on click).
-        Skips keywords that are already present as tags.
+        The keyword component uses:
+        - Input: #editEditorKeywords (class c-keywords--tags-input)
+        - Tags: <button class="c-keywords--tag" data-tag-name="name">
+        - Container: [data-component-keywords-input-container]
+        This is NOT Tagify — it's a custom component.
+
+        IMPORTANT: Only select a suggestion that is an EXACT match for the
+        keyword. Never select partial/startsWith matches — that picks the
+        wrong keyword.
         """
         assert self.page is not None
+        # Keyword section is glitchy — always run at normal speed
+        # regardless of the global SPEED_FACTOR setting
+        saved_speed = helpers.SPEED_FACTOR
+        helpers.SPEED_FACTOR = 1.0
         try:
             # ── Check if keyword already exists as a tag ──────────────
             existing_tags = self.page.locator(
-                ".tagify__tag, "
-                ".tag, "
-                "[class*='keyword-tag'], "
-                "#keywords-autocomplete-holder .tag, "
-                "[data-component-keyword-tag]"
+                "button.c-keywords--tag, "
+                "[data-tag-name]"
             )
             tag_count = await existing_tags.count()
             for i in range(tag_count):
-                tag_text = (await existing_tags.nth(i).inner_text()).strip().lower()
-                # Tags may include an "x" or "×" remove button text — strip it
-                tag_text = tag_text.replace("×", "").replace("x", "").strip()
-                if tag_text == keyword.lower().strip():
-                    logger.info("  Keyword '%s' already exists — skipping", keyword)
+                data_name = await existing_tags.nth(i).get_attribute("data-tag-name")
+                if data_name and data_name.strip().lower() == keyword.strip().lower():
+                    logger.info("  Keyword '%s' already exists -- skipping", keyword)
                     return True
 
             # ── Find the tag input field ──────────────────────────────
-            # NOTE: Tagify hides the original <input> and creates a .tagify
-            # wrapper with .tagify__input inside. Target the visible Tagify
-            # input FIRST, then fall back to raw input IDs.
             tag_input = (
-                self.page.locator(".tagify__input")
-                .or_(self.page.locator("[data-component-keywords-input]"))
-                .or_(self.page.locator("#keywords-autocomplete-holder input[type='text']"))
-                .or_(self.page.get_by_placeholder("Add a tag"))
-                .or_(self.page.locator("#addEditorkeywords"))
+                self.page.locator("#editEditorKeywords")
                 .or_(self.page.locator("#addEditorKeywords"))
-                .or_(self.page.locator("#editEditorKeywords"))
+                .or_(self.page.locator("[data-component-keywords-input]"))
+                .or_(self.page.locator(".c-keywords--tags-input"))
                 .or_(self.page.locator("#editEditorkeywords"))
+                .or_(self.page.locator("#addEditorkeywords"))
             )
             if await tag_input.count() == 0:
                 logger.warning("Tags input not found on page")
                 return False
 
-            # Scroll into view, clear any leftover text, and focus
+            # Scroll into view, clear, and focus
             await tag_input.first.evaluate(
                 "el => { el.scrollIntoView({block: 'center'}); el.value = ''; }"
             )
             await tag_input.first.click(timeout=5000)
-            await human_delay(0.2, 0.3)
-
-            # Select all and delete any residual text in the input
-            await self.page.keyboard.press("Control+a")
-            await self.page.keyboard.press("Backspace")
-            await human_delay(0.1, 0.2)
-
-            # Type the keyword character by character to trigger autocomplete
-            for ch in keyword:
-                await self.page.keyboard.type(ch, delay=random.randint(30, 60))
-            await human_delay(1.0, 1.5)
-
-            # Look for a matching suggestion in the autocomplete dropdown.
-            # Strategy: try Tagify dropdown items first (most common), then
-            # CSS selectors, then broad text match. Skip role="option" as it
-            # matches hidden <option> elements in the collection <select>.
-
-            # 1. Try Tagify dropdown items (the actual visible suggestions)
-            dropdown_suggestion = (
-                self.page.locator(
-                    ".tagify__dropdown__item, "
-                    "#keywords-autocomplete-holder li, "
-                    "[class*='autocomplete-list'] li, "
-                    "[class*='autocomplete'] li, "
-                    "ul.autocomplete li"
-                ).filter(has_text=keyword)
-            )
-            if await dropdown_suggestion.count() > 0:
-                await human_click(dropdown_suggestion.first)
-                logger.info("  Added keyword: '%s' (dropdown)", keyword)
-                await human_delay(0.3, 0.5)
-                return True
-
-            # 2. Broad text match, but EXCLUDE existing tags and their children
-            #    Tags have classes like .tag, .tagify__tag, or are inside
-            #    .keywords-tag-holder. We only want suggestion/autocomplete items.
-            all_text_matches = self.page.get_by_text(keyword, exact=True)
-            match_count = await all_text_matches.count()
-            for i in range(match_count):
-                el = all_text_matches.nth(i)
-                # Check if this element is inside a tag (existing keyword) — skip it
-                is_tag = await el.evaluate(
-                    """el => {
-                        let node = el;
-                        while (node) {
-                            const cls = (node.className || '').toString().toLowerCase();
-                            if (cls.includes('tag') && !cls.includes('autocomplete') && !cls.includes('dropdown'))
-                                return true;
-                            node = node.parentElement;
-                        }
-                        return false;
-                    }"""
-                )
-                if not is_tag:
-                    await human_click(el)
-                    logger.info("  Added keyword: '%s' (text match)", keyword)
-                    await human_delay(0.3, 0.5)
-                    return True
-
-            # 3. If no match, try pressing Enter to submit the typed keyword
-            await self.page.keyboard.press("Enter")
             await human_delay(0.3, 0.5)
 
-            # Check if a tag was actually added by looking for it in the tag container
-            tag_elements = self.page.locator(
-                ".tagify__tag, .tag, [class*='keyword-tag']"
-            ).filter(has_text=keyword)
-            if await tag_elements.count() > 0:
-                logger.info("  Added keyword via Enter: '%s'", keyword)
-                return True
+            # Clear any residual text
+            await self.page.keyboard.press("Control+a")
+            await self.page.keyboard.press("Backspace")
+            await human_delay(0.2, 0.3)
 
-            # Clear the typed text if nothing worked
+            # Type keyword at a natural pace
+            for ch in keyword:
+                await self.page.keyboard.type(ch, delay=random.randint(60, 100))
+            await human_delay(1.5, 2.0)  # wait for autocomplete dropdown to appear
+
+            # ── JS find and click EXACT matching suggestion ───────────
+            clicked = await self.page.evaluate(
+                """(keyword) => {
+                    const kw = keyword.toLowerCase().trim();
+                    const walker = document.createTreeWalker(
+                        document.body, NodeFilter.SHOW_ELEMENT
+                    );
+                    const candidates = [];
+                    while (walker.nextNode()) {
+                        const el = walker.currentNode;
+                        if (el.offsetParent === null) continue;
+                        if (el.tagName === 'BUTTON' && el.classList.contains('c-keywords--tag')) continue;
+                        if (['OPTION','INPUT','LABEL','H1','H2','H3','H4','H5','ASIDE','SELECT'].includes(el.tagName)) continue;
+                        if (el.classList.contains('c-sections--tag')) continue;
+
+                        let ownText = '';
+                        for (const node of el.childNodes) {
+                            if (node.nodeType === Node.TEXT_NODE) {
+                                ownText += node.textContent;
+                            }
+                        }
+                        ownText = ownText.trim().toLowerCase();
+                        const isLeaf = el.children.length === 0;
+                        const text = isLeaf
+                            ? (el.textContent || '').trim().toLowerCase()
+                            : ownText;
+                        if (!text) continue;
+                        if (text !== kw) continue;
+                        candidates.push({el: el, text: text, isLeaf: isLeaf, childCount: el.children.length});
+                    }
+                    candidates.sort((a, b) => {
+                        if (a.isLeaf !== b.isLeaf) return b.isLeaf - a.isLeaf;
+                        return a.childCount - b.childCount;
+                    });
+                    if (candidates.length > 0) {
+                        const best = candidates[0];
+                        best.el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true}));
+                        best.el.click();
+                        return 'exact: ' + best.text;
+                    }
+                    return null;
+                }""", keyword
+            )
+            if clicked:
+                logger.info("  Added keyword: '%s' (JS %s)", keyword, clicked)
+                await human_delay(0.5, 0.8)
+                verify = self.page.locator(
+                    f"button.c-keywords--tag[data-tag-name='{keyword}'], "
+                    f"button.c-keywords--tag[data-tag-name='{keyword.lower()}']"
+                )
+                if await verify.count() > 0:
+                    return True
+                broad_check = self.page.locator("button.c-keywords--tag").filter(has_text=keyword)
+                if await broad_check.count() > 0:
+                    return True
+                logger.info("  JS click fired but tag not confirmed")
+
+            # ── No exact match found — clean up and return False ──────
+            # Do NOT blindly ArrowDown+Enter — that selects whatever
+            # random suggestion is highlighted, not our keyword.
             await tag_input.first.click()
             await self.page.keyboard.press("Control+a")
             await self.page.keyboard.press("Backspace")
@@ -1116,16 +1210,19 @@ class SnappAgent:
         except Exception as exc:
             logger.error("Error adding keyword '%s': %s", keyword, exc, exc_info=True)
             return False
+        finally:
+            helpers.SPEED_FACTOR = saved_speed
 
     async def create_keyword_on_internal(self, keyword: str) -> bool:
         """Navigate to the internal keywords page, create a keyword, then return."""
         assert self.page is not None and self.context is not None
         logger.info("Creating keyword '%s' on internal URL", keyword)
+        new_page = None
         try:
             # Open in a new tab
             new_page = await self.context.new_page()
-            await new_page.goto(INTERNAL_KEYWORDS_URL, wait_until="domcontentloaded", timeout=5_000)
-            await human_delay(2, 4)
+            await new_page.goto(INTERNAL_KEYWORDS_URL, wait_until="domcontentloaded", timeout=15_000)
+            await human_delay(0.5, 1.0)
 
             # Find the keyword input and add button
             kw_input = (
@@ -1136,7 +1233,7 @@ class SnappAgent:
             )
             if await kw_input.count() > 0:
                 await human_type(new_page, kw_input.first, keyword)
-                await human_delay(1, 2)
+                await human_delay(0.3, 0.5)
                 add_btn = (
                     new_page.get_by_role("button", name="Add")
                     .or_(new_page.get_by_role("button", name="Create"))
@@ -1145,23 +1242,30 @@ class SnappAgent:
                 )
                 if await add_btn.count() > 0:
                     await human_click(add_btn.first)
-                    await human_delay(2, 3)
+                    await human_delay(0.5, 1.0)
                     logger.info("Keyword '%s' created on internal URL", keyword)
                 else:
                     logger.warning("Add/Create button not found on internal keywords page")
             else:
                 logger.warning("Keyword input not found on internal keywords page")
 
-            await new_page.close()
-            # Bring focus back to the main page
-            if self.page:
-                await self.page.bring_to_front()
-                await human_delay(1, 2)
             return True
 
         except Exception as exc:
             logger.error("Error creating keyword on internal URL: %s", exc, exc_info=True)
             return False
+        finally:
+            # Always close the new tab and bring focus back
+            try:
+                if new_page and not new_page.is_closed():
+                    await new_page.close()
+            except Exception:
+                pass
+            try:
+                if self.page and not self.page.is_closed():
+                    await self.page.bring_to_front()
+            except Exception:
+                pass
 
     # ── Future onboarding unavailability (inline, during onboard form) ────
 
@@ -1519,6 +1623,150 @@ class SnappAgent:
 
         logger.info("Save completed (no explicit toast)")
         return True
+
+    # ── Single update (for bulk workflows) ─────────────────────────────────
+
+    async def run_single_update(self) -> dict[str, Any]:
+        """Execute a single editor update within an already-open browser session.
+
+        Assumes:
+          - Browser is launched and logged in.
+          - The journal page is already loaded (editor list visible).
+
+        Workflow: search editor → click Edit profile → Next → fill fields → save.
+
+        Returns a detailed result dict:
+            {
+                "editor_name": str,
+                "status": "success" | "failed" | "not_found" | "error",
+                "fields_requested": {field: value, ...},
+                "fields_completed": {field: bool, ...},
+                "error": str | None,
+            }
+        """
+        assert self.page is not None
+        editor_name = self.request.get("editor_name", "?")
+        result: dict[str, Any] = {
+            "editor_name": editor_name,
+            "status": "error",
+            "fields_requested": {},
+            "fields_completed": {},
+            "error": None,
+        }
+
+        # Identify which fields were requested
+        field_checks = {
+            "sections": self.request.get("sections", "").strip(),
+            "keywords": self.request.get("keywords", "").strip(),
+            "role": self.request.get("role", "").strip(),
+            "affiliation": self.request.get("affiliation", "").strip(),
+            "status_change": self.request.get("status", "").strip(),
+            "unavailable_from": self.request.get("unavailable_from", "").strip(),
+        }
+        for k, v in field_checks.items():
+            if v:
+                result["fields_requested"][k] = v
+                result["fields_completed"][k] = False
+
+        try:
+            # 1. Search for editor
+            logger.info("-- Bulk update: searching for '%s' --", editor_name)
+            if not await self.search_editor(editor_name):
+                result["status"] = "not_found"
+                result["error"] = f"Editor '{editor_name}' not found in journal"
+                return result
+
+            # 2. Click Edit profile
+            if not await self.click_edit_profile():
+                result["status"] = "failed"
+                result["error"] = "Could not click 'Edit profile'"
+                return result
+
+            # 3. Handle page 1: affiliation
+            affiliation = self.request.get("affiliation", "").strip()
+            if affiliation:
+                try:
+                    if await self._fill_affiliation_autocomplete(affiliation):
+                        result["fields_completed"]["affiliation"] = True
+                except Exception as exc:
+                    logger.warning("Affiliation failed: %s", exc)
+
+            # 4. Click Next to page 2
+            await self._click_next()
+
+            # 5. Role
+            role = self.request.get("role", "").strip()
+            if role:
+                try:
+                    if await self._select_role_radio(role):
+                        result["fields_completed"]["role"] = True
+                except Exception as exc:
+                    logger.warning("Role selection failed: %s", exc)
+
+            # 6. Sections
+            sections = self.request.get("sections", "").strip()
+            if sections:
+                try:
+                    await self._fill_board_sections(sections)
+                    result["fields_completed"]["sections"] = True
+                except Exception as exc:
+                    logger.warning("Section fill failed: %s", exc)
+
+            # 7. Keywords (use internal creation if keyword missing, but safely)
+            keywords = self.request.get("keywords", "").strip()
+            if keywords:
+                try:
+                    await self.add_keywords(keywords, skip_internal_creation=False)
+                    result["fields_completed"]["keywords"] = True
+                except Exception as exc:
+                    logger.warning("Keyword add failed: %s", exc)
+
+            # 8. Unavailability
+            uf = self.request.get("unavailable_from", "").strip()
+            ut = self.request.get("unavailable_to", "").strip()
+            if uf and ut:
+                try:
+                    if await self.set_unavailability(uf, ut):
+                        result["fields_completed"]["unavailable_from"] = True
+                except Exception as exc:
+                    logger.warning("Unavailability failed: %s", exc)
+
+            # 9. Status change
+            status_val = self.request.get("status", "").strip()
+            if status_val:
+                try:
+                    if await self._select_status_radio(status_val):
+                        result["fields_completed"]["status_change"] = True
+                except Exception as exc:
+                    logger.warning("Status change failed: %s", exc)
+
+            # 10. Save (or skip in no-save mode)
+            if self.no_save:
+                logger.info("NO-SAVE mode — skipping save for '%s'", editor_name)
+                result["status"] = "success"
+            else:
+                if await self._click_save():
+                    result["status"] = "success"
+                else:
+                    result["status"] = "failed"
+                    result["error"] = "Save button click failed"
+
+            # Check if all requested fields were completed
+            all_done = all(result["fields_completed"].get(k, True)
+                          for k in result["fields_requested"])
+            if result["status"] == "success" and not all_done:
+                result["status"] = "partial"
+                failed_fields = [k for k, v in result["fields_completed"].items()
+                                 if not v]
+                result["error"] = f"Partial: failed fields: {', '.join(failed_fields)}"
+
+        except Exception as exc:
+            result["status"] = "error"
+            result["error"] = str(exc)
+            logger.error("Bulk update error for '%s': %s", editor_name, exc, exc_info=True)
+            await self._dump_page(f"bulk_update_error_{editor_name.replace(' ', '_')}")
+
+        return result
 
     # ── Profile update (existing editor) ──────────────────────────────────
 
